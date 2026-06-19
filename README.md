@@ -1,8 +1,7 @@
 # cc-copilot-proxy
 
 Local OpenAI-compatible proxy for Command Code's `/alpha/generate` endpoint.
-Lets GitHub Copilot CLI and VS Code use your **Go plan** ($5/mo) instead of
-the Provider plan ($15/mo).
+Lets GitHub Copilot CLI and VS Code use your **Go plan**.
 
 ## Quick start
 
