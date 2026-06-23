@@ -6,8 +6,11 @@ Lets GitHub Copilot CLI and VS Code use your **Go plan**.
 ## Quick start
 
 ```sh
-# Terminal 1 — start proxy
-cd ~/repos/cc-copilot-proxy
+# clone the repo
+cd ~/repos
+git clone https://github.com/shourovrm/cc-copilot-proxy
+# start proxy
+cd cc-copilot-proxy
 node proxy.mjs
 
 # Terminal 2 — Copilot CLI
