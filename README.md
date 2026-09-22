@@ -31,6 +31,43 @@ The proxy also serves as a custom endpoint for VS Code Copilot BYOK
 After `Developer: Reload Window`, models appear in the Copilot Chat dropdown
 under the **Command Code** group.
 
+## Automatic model list
+
+The proxy keeps the **Command Code** group of that file in sync with the
+models your plan can use. VS Code reads the file only when a window loads, so
+after the proxy prints `VS Code model list updated`, run
+`Developer: Reload Window`.
+
+On every start, and every 5 minutes after, the proxy:
+
+1. Fetches Command Code's model list (no tokens).
+2. Sends each model it has not tested before one `hi` message capped at a
+   16-token reply, about 20 tokens per model. A first run over ~75 models costs
+   roughly 1,500 tokens and takes a few minutes in the background; later
+   starts test only models Command Code has added since.
+3. Adds models that answer, removes models that fail or that Command Code no
+   longer lists, and leaves every other group in the file untouched. The
+   previous file is saved as `chatLanguageModels.json.bak`.
+
+Test results are stored in `~/.config/cc-copilot-proxy/model-checks.json`.
+A model that fails only for a temporary reason (network error, rate limit,
+server error) is not recorded and is tested again on the next start.
+
+An account with no credits gets `insufficient credits` for every model. In
+that case the proxy records nothing and leaves the VS Code file unchanged, so
+an expired plan does not empty your model list.
+
+Entries already in the file are kept as written, so hand-edited values such as
+`"vision": true` survive syncing. New entries get `toolCalling: true`,
+`vision: false`, `maxInputTokens` set to the model's context length, and
+`maxOutputTokens: 64000`.
+
+After changing plans, test every model again:
+
+```sh
+node proxy.mjs --recheck
+```
+
 ## Check available models
 
 ```sh
@@ -41,7 +78,10 @@ curl -s http://127.0.0.1:5959/v1/models | python3 -c \
 ## Add a new model
 
 ### VS Code
-Edit `chatLanguageModels.json`, add an entry to the `models` array:
+New models on your plan are added automatically (see
+[Automatic model list](#automatic-model-list)). To add one by hand, or to
+override its settings, edit `chatLanguageModels.json` and add an entry to the
+`models` array:
 
 ```json
 {
@@ -116,3 +156,4 @@ No proxy needed.
 | `CC_PROXY_PORT` | `5959` | Proxy listen port |
 | `CC_PROXY_DEBUG` | `0` | Set to `1` for request logging |
 | `COMMANDCODE_API_KEY` | (reads auth file) | Override API key from env |
+| `CC_PROXY_VSCODE_MODELS_FILE` | VS Code Insiders `User/chatLanguageModels.json` | File the model list is synced into |

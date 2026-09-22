@@ -6,11 +6,13 @@
  * OpenAI Chat Completions requests into Command Code's native format.
  *
  * Usage:
- *   node proxy.mjs
+ *   node proxy.mjs              — start; syncs the VS Code model list in the background
+ *   node proxy.mjs --recheck    — forget earlier model checks and test every model again
  *
  * Env vars (optional):
  *   COMMANDCODE_API_KEY     — API key (falls back to ~/.commandcode/auth.json)
  *   CC_PROXY_PORT           — listen port (default 5959)
+ *   CC_PROXY_VSCODE_MODELS_FILE — VS Code chatLanguageModels.json to keep in sync
  *
  * Then point Copilot CLI at it:
  *   export COPILOT_PROVIDER_BASE_URL="http://127.0.0.1:5959"
@@ -20,9 +22,9 @@
 
 import { createServer } from "node:http"
 import { randomUUID } from "node:crypto"
-import { existsSync, readFileSync } from "node:fs"
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
-import { join } from "node:path"
+import { dirname, join } from "node:path"
 
 // ── Config ─────────────────────────────────────────────────────────────
 
@@ -321,6 +323,15 @@ function ccEventToOpenAIChunk(event, model, chatId) {
 
 // ── Non-streaming response (accumulate streaming events) ───────────────
 
+function ccHeaders(apiKey) {
+  return {
+    "Content-Type": "application/json",
+    Authorization: `Bearer ${apiKey}`,
+    "x-command-code-version": CC_CLI_VERSION,
+    "x-cli-environment": "production",
+  }
+}
+
 async function nonStreamingResponse(model, apiKey, ccBody) {
   const streamBody = {
     ...ccBody,
@@ -331,12 +342,7 @@ async function nonStreamingResponse(model, apiKey, ccBody) {
 
   const res = await fetch(`${API_BASE}/alpha/generate`, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${apiKey}`,
-      "x-command-code-version": CC_CLI_VERSION,
-      "x-cli-environment": "production",
-    },
+    headers: ccHeaders(apiKey),
     body: JSON.stringify(streamBody),
   })
 
@@ -446,12 +452,7 @@ async function streamingResponse(model, apiKey, ccBody, res) {
   try {
     ffRes = await fetch(`${API_BASE}/alpha/generate`, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${apiKey}`,
-        "x-command-code-version": CC_CLI_VERSION,
-        "x-cli-environment": "production",
-      },
+      headers: ccHeaders(apiKey),
       body: JSON.stringify(ccBody),
     })
   } catch (e) {
@@ -528,6 +529,231 @@ async function streamingResponse(model, apiKey, ccBody, res) {
   log("streaming done. events:", eventCount)
 }
 
+// ── VS Code model sync ─────────────────────────────────────────────────
+//
+// VS Code never asks the proxy for its model list; it only reads
+// chatLanguageModels.json. So the proxy tests each upstream model once with
+// a tiny request, remembers the verdict, and writes the models that work on
+// the user's plan into the "Command Code" group of that file.
+
+const VSCODE_GROUP_NAME = "Command Code"
+const MODEL_CHECKS_FILE = join(homedir(), ".config", "cc-copilot-proxy", "model-checks.json")
+const PROBE_MAX_TOKENS = 16
+const PROBE_DELAY_MS = 500
+const RECHECK_MODELS = process.argv.includes("--recheck")
+
+function defaultVSCodeModelsFile() {
+  const home = homedir()
+  if (process.platform === "darwin") {
+    return join(home, "Library", "Application Support", "Code - Insiders", "User", "chatLanguageModels.json")
+  }
+  if (process.platform === "win32") {
+    const appData = process.env.APPDATA ?? join(home, "AppData", "Roaming")
+    return join(appData, "Code - Insiders", "User", "chatLanguageModels.json")
+  }
+  return join(home, ".config", "Code - Insiders", "User", "chatLanguageModels.json")
+}
+
+const VSCODE_MODELS_FILE = process.env.CC_PROXY_VSCODE_MODELS_FILE ?? defaultVSCodeModelsFile()
+
+function loadModelChecks() {
+  try {
+    const checks = JSON.parse(readFileSync(MODEL_CHECKS_FILE, "utf-8"))
+    return isRecord(checks) ? checks : {}
+  } catch {
+    return {}
+  }
+}
+
+function saveModelChecks(checks) {
+  mkdirSync(dirname(MODEL_CHECKS_FILE), { recursive: true })
+  writeFileSync(MODEL_CHECKS_FILE, JSON.stringify(checks, null, 2) + "\n")
+}
+
+// The upstream stream can report an error inside a 200 response.
+function findStreamError(streamText) {
+  for (const line of streamText.split("\n")) {
+    let trimmed = line.trim()
+    if (trimmed.startsWith("data:")) trimmed = trimmed.slice(5).trim()
+    if (!trimmed.startsWith("{")) continue
+    try {
+      const event = JSON.parse(trimmed)
+      if (event.type === "error") return JSON.stringify(event.error ?? event)
+    } catch {}
+  }
+  return null
+}
+
+// Outcomes: "approved" and "rejected" are remembered; "no-credits" and
+// "unknown" are retried on the next start.
+function classifyProbeError(status, message) {
+  if (/insufficient credits/i.test(message)) return { outcome: "no-credits", reason: message }
+  if (status === 401 || status === 408 || status === 429 || status >= 500) {
+    return { outcome: "unknown", reason: `HTTP ${status}: ${message}` }
+  }
+  return { outcome: "rejected", reason: `HTTP ${status}: ${message}` }
+}
+
+async function probeModel(modelId, apiKey) {
+  const ccBody = buildCCRequest({
+    model: modelId,
+    messages: [{ role: "user", content: "hi" }],
+    max_tokens: PROBE_MAX_TOKENS,
+    stream: true,
+  })
+
+  let res
+  try {
+    res = await fetch(`${API_BASE}/alpha/generate`, {
+      method: "POST",
+      headers: ccHeaders(apiKey),
+      body: JSON.stringify(ccBody),
+    })
+  } catch (e) {
+    return { outcome: "unknown", reason: e.message }
+  }
+
+  const text = await res.text().catch(() => "")
+  if (!res.ok) return classifyProbeError(res.status, text.slice(0, 300))
+
+  const streamError = findStreamError(text)
+  if (streamError) return classifyProbeError(400, streamError.slice(0, 300))
+  return { outcome: "approved", reason: "answered" }
+}
+
+// "Insufficient credits" is ambiguous: it is what a plan returns for a model
+// it does not cover, but also what every model returns once the account has
+// no credits at all. It only means "not on your plan" if some model still works.
+async function accountStillHasCredits(approvedThisRun, checks, apiKey) {
+  if (approvedThisRun > 0) return true
+  const knownGoodModel = Object.keys(checks).find((id) => checks[id].status === "approved")
+  if (!knownGoodModel) return false
+  const result = await probeModel(knownGoodModel, apiKey)
+  return result.outcome === "approved"
+}
+
+async function checkNewModels(models, checks, apiKey) {
+  console.log(`[model sync] Checking ${models.length} model(s) against your plan...`)
+  const creditRefusedIds = []
+  let approvedThisRun = 0
+
+  for (const model of models) {
+    const result = await probeModel(model.id, apiKey)
+    log("probe", model.id, result.outcome, result.reason)
+
+    if (result.outcome === "approved" || result.outcome === "rejected") {
+      checks[model.id] = { status: result.outcome, reason: result.reason, checkedAt: new Date().toISOString() }
+      if (result.outcome === "approved") approvedThisRun++
+    } else if (result.outcome === "no-credits") {
+      creditRefusedIds.push(model.id)
+    }
+    await new Promise((resolve) => setTimeout(resolve, PROBE_DELAY_MS))
+  }
+
+  if (creditRefusedIds.length > 0) {
+    if (await accountStillHasCredits(approvedThisRun, checks, apiKey)) {
+      for (const id of creditRefusedIds) {
+        checks[id] = { status: "rejected", reason: "not covered by plan", checkedAt: new Date().toISOString() }
+      }
+    } else {
+      console.log(`[model sync] Account has no credits; ${creditRefusedIds.length} model(s) will be rechecked next start.`)
+    }
+  }
+
+  saveModelChecks(checks)
+}
+
+function vscodeModelEntry(model) {
+  const contextLength = model.context_length ?? 128_000
+  return {
+    id: model.id,
+    name: model.name ?? model.id,
+    url: `http://127.0.0.1:${PORT}/v1/chat/completions`,
+    toolCalling: true,
+    vision: false,
+    maxInputTokens: contextLength,
+    maxOutputTokens: Math.min(DEFAULT_MAX_TOKENS, contextLength),
+  }
+}
+
+function readVSCodeModelGroups() {
+  if (!existsSync(VSCODE_MODELS_FILE)) return { groups: [], previousText: "" }
+  const previousText = readFileSync(VSCODE_MODELS_FILE, "utf-8")
+  const groups = JSON.parse(previousText)
+  if (!Array.isArray(groups)) throw new Error("top level is not an array")
+  return { groups, previousText }
+}
+
+function writeVSCodeModels(checks) {
+  // No approved model at all means nothing could be checked yet; keep what the user has.
+  if (!modelsCache.some((m) => checks[m.id]?.status === "approved")) return
+  if (!existsSync(dirname(VSCODE_MODELS_FILE))) {
+    log("VS Code Insiders user folder not found, skipping:", dirname(VSCODE_MODELS_FILE))
+    return
+  }
+
+  let groups
+  let previousText
+  try {
+    ;({ groups, previousText } = readVSCodeModelGroups())
+  } catch (e) {
+    console.error(`[model sync] Not touching ${VSCODE_MODELS_FILE}: ${e.message}`)
+    return
+  }
+
+  let group = groups.find((g) => isRecord(g) && g.name === VSCODE_GROUP_NAME)
+  if (!group) {
+    group = {
+      name: VSCODE_GROUP_NAME,
+      vendor: "customendpoint",
+      apiKey: "proxy-handles-auth",
+      apiType: "chat-completions",
+      models: [],
+    }
+    groups.push(group)
+  }
+
+  // Entries already in the file win, so hand-edited settings (vision, token limits) survive.
+  // Models not checked yet (for example after a network error) keep their place until they are.
+  const existingById = new Map((group.models ?? []).map((m) => [m.id, m]))
+  const shownModels = modelsCache.filter((m) => {
+    const status = checks[m.id]?.status
+    return status === "approved" || (status === undefined && existingById.has(m.id))
+  })
+  group.models = shownModels.map((m) => existingById.get(m.id) ?? vscodeModelEntry(m))
+
+  const nextText = JSON.stringify(groups, null, 2) + "\n"
+  if (nextText === previousText) return
+
+  if (previousText) writeFileSync(`${VSCODE_MODELS_FILE}.bak`, previousText)
+  writeFileSync(VSCODE_MODELS_FILE, nextText)
+
+  const shownIds = new Set(shownModels.map((m) => m.id))
+  const addedCount = shownModels.filter((m) => !existingById.has(m.id)).length
+  const removedCount = [...existingById.keys()].filter((id) => !shownIds.has(id)).length
+  console.log(
+    `[model sync] VS Code model list updated (${addedCount} added, ${removedCount} removed). ` +
+      `Run "Developer: Reload Window" in VS Code to see it.`,
+  )
+}
+
+let modelSyncRunning = false
+
+async function syncVSCodeModels(apiKey) {
+  if (modelSyncRunning || modelsCache.length === 0) return
+  modelSyncRunning = true
+  try {
+    const checks = loadModelChecks()
+    const untestedModels = modelsCache.filter((m) => !checks[m.id])
+    if (untestedModels.length > 0) await checkNewModels(untestedModels, checks, apiKey)
+    writeVSCodeModels(checks)
+  } catch (e) {
+    console.error("[model sync] failed:", e.message)
+  } finally {
+    modelSyncRunning = false
+  }
+}
+
 // ── HTTP handlers ──────────────────────────────────────────────────────
 
 function sendJSON(res, status, body) {
@@ -576,8 +802,13 @@ async function main() {
 
   log("API key found, prefix:", apiKey.slice(0, 10))
 
+  if (RECHECK_MODELS) rmSync(MODEL_CHECKS_FILE, { force: true })
+
   await refreshModels()
-  setInterval(refreshModels, 5 * 60_000)
+  setInterval(async () => {
+    await refreshModels()
+    await syncVSCodeModels(apiKey)
+  }, 5 * 60_000)
 
   const server = createServer((req, res) => {
     res.setHeader("Access-Control-Allow-Origin", "*")
@@ -654,6 +885,7 @@ async function main() {
     console.log(`  export COPILOT_MODEL="deepseek/deepseek-v4-flash"`)
     console.log(`  copilot`)
     console.log()
+    syncVSCodeModels(apiKey)
   })
 }
 
